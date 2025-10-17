@@ -22,6 +22,8 @@ export default function ImamDashboard() {
   const [streaming, setStreaming] = useState(false);
   const [streamStatus, setStreamStatus] = useState("");
   const API_URL = "https://redesigned-barnacle-x5gxrwwq76prhpvpj-5000.app.github.dev"; // backend base URL
+  // For testing only: shared secret fallback (must match server MASJID_SHARED_SECRET)
+  const SHARED_KEY = "test_shared_secret_123";
 
   // Redirect if user info missing or role invalid
   useEffect(() => {
@@ -79,12 +81,24 @@ export default function ImamDashboard() {
   useEffect(() => {
     if (!masjidId) return;
 
-    const ws = new WebSocket(`${API_URL.replace("http", "ws")}/ws?masjidId=${masjidId}&token=${token}`);
+    // Use same helper to pick ws/wss and ensure we connect to the correct path
+    const wsUrl = `${getWsProtocol(API_URL)}/ws`;
+    const ws = new WebSocket(wsUrl);
     wsRef.current = ws;
 
     ws.onopen = () => {
       console.log("✅ WebSocket connected");
       setStatus("WebSocket connected to server");
+      // Register this dashboard as a streamer/viewer so it receives presence updates
+      try {
+        // send token when available; include shared key as a fallback for testing/dev
+        const payload = { type: 'stream-register', masjidId, role: 'streamer' };
+        if (token) payload.token = token;
+        else payload.key = SHARED_KEY;
+        // also include key as fallback even if token exists (safe for local testing)
+        payload.key = SHARED_KEY;
+        ws.send(JSON.stringify(payload));
+      } catch (e) { console.warn('Stream-register send failed', e); }
     };
 
     ws.onmessage = (event) => {
@@ -178,9 +192,9 @@ export default function ImamDashboard() {
       setStreamStatus("Initializing microphone (PCM capture)...");
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-      // create stream websocket
-      const wsUrl = `${getWsProtocol(API_URL)}/ws`;
-      const sWs = new WebSocket(wsUrl);
+  // create stream websocket (include masjidId and token as query params)
+  const wsUrl = `${getWsProtocol(API_URL)}/ws?masjidId=${masjidId}&token=${token}`;
+  const sWs = new WebSocket(wsUrl);
       streamWsRef.current = sWs;
       sWs.binaryType = "arraybuffer";
 

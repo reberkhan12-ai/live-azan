@@ -90,7 +90,8 @@ function setupWebSocket(server) {
   }
 
   wss.on("connection", async (ws, req) => {
-    console.log("✅ New WebSocket connection");
+    const remoteIp = req.socket && req.socket.remoteAddress ? req.socket.remoteAddress : 'unknown';
+    console.log("✅ New WebSocket connection", { url: req.url, ip: remoteIp });
 
     let registered = false;
     let masjidId = null;
@@ -101,30 +102,34 @@ function setupWebSocket(server) {
     ws.status = "online";
 
     ws.on("message", async (msg, isBinary) => {
-      // If this is binary, treat as audio chunk from a streamer
-      if (isBinary) {
-        // forward to all devices in masjid (if registered as streamer)
-        if (ws._streamer && ws._masjidId) {
-          const masjidIdStream = ws._masjidId;
-          // enqueue Buffer (Node Buffer) to broadcast queue
-          const buffer = Buffer.from(msg);
-          enqueueBroadcast(masjidIdStream, buffer);
-        }
-        return;
-      }
-
-      // Expect text JSON messages
-      let data;
       try {
-        data = JSON.parse(msg.toString());
-      } catch (err) {
-        console.error("Invalid JSON from ws client:", err);
-        return;
-      }
+        if (isBinary) {
+          const len = msg.length || (msg.byteLength || 0);
+          console.log(`📥 Binary frame received from ${remoteIp} (streamer=${!!ws._streamer}) len=${len} bytes masjid=${ws._masjidId || 'unknown'}`);
+          // If this is binary, treat as audio chunk from a streamer
+          if (ws._streamer && ws._masjidId) {
+            const masjidIdStream = ws._masjidId;
+            // enqueue Buffer (Node Buffer) to broadcast queue
+            const buffer = Buffer.from(msg);
+            enqueueBroadcast(masjidIdStream, buffer);
+          }
+          return;
+        }
+
+        // Expect text JSON messages
+        const txt = msg.toString();
+        let data;
+        try {
+          data = JSON.parse(txt);
+        } catch (err) {
+          console.warn(`⚠️ Non-JSON text message from ${remoteIp}:`, txt.substring(0, 200));
+          return;
+        }
+        console.log(`📨 JSON message from ${remoteIp}: type=${data.type || 'unknown'} masjidId=${data.masjidId || data.masjidId}`);
 
       // ===== Registration =====
       // { type: 'register', masjidId, deviceId, token?, key? }
-      if (data.type === "register") {
+  if (data.type === "register") {
         const { masjidId: mId, deviceId: dId, token, key } = data;
         if (!mId || !dId) {
           safeSend(ws, JSON.stringify({ type: "error", message: "Missing registration info" }));
@@ -147,6 +152,7 @@ function setupWebSocket(server) {
 
 
         if (!authOk) {
+          console.warn(`Authentication failed for register attempt from ${remoteIp} masjid=${mId} device=${dId}`);
           safeSend(ws, JSON.stringify({ type: "error", message: "Authentication failed" }));
           try { ws.close(); } catch (e) {}
           return;
@@ -160,7 +166,7 @@ function setupWebSocket(server) {
   conns.set(deviceId, { ws, status: "online" });
   registered = true;
 
-  console.log(`Device registered: ${deviceId} under Masjid: ${masjidId}`);
+  console.log(`Device registered: ${deviceId} under Masjid: ${masjidId} from ${remoteIp}`);
   safeSend(ws, JSON.stringify({ type: "ack", message: "Registered successfully" }));
   emitter.emit("registered", { masjidId, deviceId });
 
@@ -199,6 +205,7 @@ function setupWebSocket(server) {
         ws._masjidId = mId;
         if (!masjidStreamers.has(mId)) masjidStreamers.set(mId, new Set());
         masjidStreamers.get(mId).add(ws);
+        console.log(`Streamer registered for masjid ${mId}`);
         safeSend(ws, JSON.stringify({ type: 'ack', message: 'Streamer registered' }));
         return;
       }
@@ -214,6 +221,9 @@ function setupWebSocket(server) {
       }
 
       // Other message types can be handled here
+    } catch (err) {
+      console.error('WebSocket message handler error:', err);
+    }
     });
 
     ws.on("pong", () => { ws.isAlive = true; });
