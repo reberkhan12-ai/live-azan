@@ -5,10 +5,11 @@ import axios from "axios";
 export default function MominDashboard() {
   const { state } = useLocation();
   const navigate = useNavigate();
-  const userEmail = state?.userEmail || state?.email || null;
-  const userName = state?.name || "Momin";
+  const stored = JSON.parse(localStorage.getItem("user") || "null");
+  const userEmail = state?.userEmail || state?.email || stored?.userEmail || null;
+  const userName = state?.name || stored?.name || "Momin";
 
-  const API_BASE = "http://localhost:5000/api"; // backend URL
+  const API_BASE = "https://redesigned-barnacle-x5gxrwwq76prhpvpj-5000.app.github.dev/api"; // backend URL
 
   const [masjid, setMasjid] = useState(null);
   const [loading, setLoading] = useState(false);

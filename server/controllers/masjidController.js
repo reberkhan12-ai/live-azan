@@ -53,6 +53,22 @@ const getTotalMomins = async (req, res) => {
   }
 };
 
+// Get Masjid by Imam email
+const getMasjidByEmail = async (req, res) => {
+  try {
+    const email = req.params.email;
+    if (!email) return res.status(400).json({ success: false, message: "Email required" });
+
+    const masjid = await Masjid.findOne({ userEmail: email });
+    if (!masjid) return res.json({ success: false, message: "No masjid found" });
+
+    res.json({ success: true, masjid });
+  } catch (err) {
+    console.error("Get masjid by email error:", err);
+    res.status(500).json({ success: false, message: "Server error" });
+  }
+};
+
 // ✅ Start Azan
 const startAzan = async (req, res) => {
   try {
@@ -129,6 +145,7 @@ const getDeviceStatus = async (req, res) => {
 module.exports = {
   registerMasjid,
   getTotalMomins,
+  getMasjidByEmail,
   startAzan,
   stopAzan, // ✅ new
   getDeviceStatus,

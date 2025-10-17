@@ -4,6 +4,7 @@ const { verifyFirebaseToken } = require("../middleware/authMiddleware");
 const {
   registerMasjid,
   getTotalMomins,
+  getMasjidByEmail,
 } = require("../controllers/masjidController");
 
 // ===== Routes =====
@@ -13,6 +14,9 @@ router.post("/", verifyFirebaseToken, registerMasjid);
 
 // Get total momins
 router.get("/momins/:masjidId", verifyFirebaseToken, getTotalMomins);
+
+// Get masjid by imam email
+router.get("/:email", verifyFirebaseToken, getMasjidByEmail);
 
 // ===== Azan control routes =====
 

@@ -19,19 +19,41 @@ export default function Register() {
     setLoading(true);
 
     try {
+      // 🔧 Ensure email scope is included
+      provider.addScope("email");
       provider.setCustomParameters({ prompt: "select_account" });
+
+      console.log("🟦 Starting Google Sign-in...");
+
       const result = await signInWithPopup(auth, provider);
       const user = result.user;
+
+      console.log("✅ Firebase User:", user);
 
       // Get Firebase ID token
       const idToken = await user.getIdToken();
 
-      // Send token and selected role to backend
+      console.log("🟢 Firebase ID Token obtained:", idToken ? "Yes" : "No");
+
+      // Fallback for missing email
+      const userEmail = user.email || user.providerData?.[0]?.email || null;
+
+      if (!userEmail) {
+        console.warn("⚠️ No email found from Firebase user object!");
+        // Stop early because backend (some deployments) expect email in the body
+        alert("Could not retrieve your email from Google. Please try a different account or enable email access.");
+        return;
+      }
+
+      // Send token, email and role to backend
+      console.log("📡 Sending request to backend with role:", selectedRole, "email:", userEmail);
       const res = await axios.post(
-        "http://localhost:5000/api/auth/check-user",
-        { role: selectedRole },
+        "https://redesigned-barnacle-x5gxrwwq76prhpvpj-5000.app.github.dev/api/auth/check-user",
+        { email: userEmail, role: selectedRole },
         { headers: { Authorization: `Bearer ${idToken}` } }
       );
+
+      console.log("🧾 Backend Response:", res.data);
 
       const data = res.data;
 
@@ -40,40 +62,51 @@ export default function Register() {
         return;
       }
 
-      // Save user info to localStorage for persistence
+      // Save user info locally
       localStorage.setItem(
         "user",
         JSON.stringify({
-          userEmail: user.email,
+          userEmail,
           name: user.displayName,
           role: selectedRole,
           token: idToken,
         })
       );
 
+      console.log("💾 User saved to localStorage:", {
+        userEmail,
+        name: user.displayName,
+        role: selectedRole,
+      });
+
       // Role-based navigation
       if (data.role === "Imam") {
         if (data.masjidRegistered) {
           alert("Welcome back, Imam! Redirecting to Dashboard...");
-          navigate("/imam-dashboard");
+          navigate("/imam-dashboard", { state: { userEmail, name: user.displayName } });
         } else {
           alert("Please register your Masjid.");
-          navigate("/register-masjid");
+          navigate("/register-masjid", { state: { userEmail, name: user.displayName } });
         }
       } else if (data.role === "Momin") {
-        navigate("/momin-dashboard");
+        navigate("/momin-dashboard", { state: { userEmail, name: user.displayName } });
       }
     } catch (err) {
-      console.error("Google Sign-in Error:", err);
+      console.error("❌ Google Sign-in Error:", err);
+
       if (err.code === "auth/popup-closed-by-user") {
         alert("Popup closed before completing sign-in.");
       } else if (err.code === "auth/cancelled-popup-request") {
         alert("Previous popup request in progress. Try again.");
+      } else if (err.response) {
+        console.error("🔴 Backend error:", err.response.data);
+        alert(`Backend Error: ${err.response.data.message || "Check console"}`);
       } else {
         alert("Google login failed. Check console for details.");
       }
     } finally {
       setLoading(false);
+      console.log("🟨 Google Sign-in flow complete.");
     }
   };
 

@@ -6,7 +6,9 @@ export default function RegisterMasjid() {
   const { state } = useLocation();
   const navigate = useNavigate();
 
-  const userEmail = state?.userEmail || state?.email || null;
+  // Try state first, then fallback to localStorage if available
+  const stored = JSON.parse(localStorage.getItem("user") || "null");
+  const userEmail = state?.userEmail || state?.email || stored?.userEmail || null;
 
   const [masjidName, setMasjidName] = useState("");
   const [address, setAddress] = useState("");
@@ -79,7 +81,7 @@ export default function RegisterMasjid() {
         pincode,
       };
 
-      const res = await fetch("http://127.0.0.1:5000/api/masjid", {
+      const res = await fetch("https://redesigned-barnacle-x5gxrwwq76prhpvpj-5000.app.github.dev/api/masjid", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

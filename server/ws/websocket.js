@@ -1,11 +1,93 @@
 const WebSocket = require("ws");
 const admin = require("../firebaseAdmin"); // Firebase admin instance for token verification
+const { EventEmitter } = require("events");
 
-// Structure: { masjidId: { deviceId: wsConnection, ... }, ... }
-const masjidConnections = {};
+// Structure: { masjidId: Map(deviceId -> { ws, status }) }
+const masjidConnections = new Map();
+// quick alias
+const masjidDevices = masjidConnections;
+
+  // Broadcast queue per masjid to avoid blocking the event loop on heavy sends
+const broadcastQueues = new Map();
+
+// Track active streamers (masjidId -> Set of ws)
+const masjidStreamers = new Map();
+// presence broadcast timers per masjid to throttle frequent updates
+const presenceTimers = new Map();
+
+function getPresenceForMasjid(masjidId) {
+  const conns = masjidDevices.get(masjidId);
+  const onlineDevices = conns ? Array.from(conns.keys()) : [];
+  const total = onlineDevices.length; // currently tracked devices
+  return { masjidId, total, online: total, offline: 0, onlineDevices };
+}
+
+function broadcastPresence(masjidId) {
+  const presence = getPresenceForMasjid(masjidId);
+  const payload = JSON.stringify({ type: 'presence-update', ...presence });
+  // Send to all streamers for this masjid
+  const s = masjidStreamers.get(masjidId);
+  if (!s) return;
+  for (const ws of s) {
+    safeSend(ws, payload);
+  }
+}
+
+function schedulePresenceBroadcast(masjidId) {
+  // throttle to max 1 per second
+  if (presenceTimers.has(masjidId)) return; // already scheduled
+  presenceTimers.set(masjidId, true);
+  setTimeout(() => {
+    presenceTimers.delete(masjidId);
+    try { broadcastPresence(masjidId); } catch (e) { console.error('Presence broadcast error', e); }
+  }, 1000);
+}
+
+function safeSend(ws, msg) {
+  try {
+    if (ws.readyState === WebSocket.OPEN) ws.send(msg);
+  } catch (err) {
+    console.error("Safe send error:", err);
+  }
+}
+
+function enqueueBroadcast(masjidId, msg) {
+  // msg can be string or Buffer
+  if (!broadcastQueues.has(masjidId)) broadcastQueues.set(masjidId, []);
+  const q = broadcastQueues.get(masjidId);
+  q.push(msg);
+  // Schedule drain next tick
+  setImmediate(() => {
+    const queue = broadcastQueues.get(masjidId) || [];
+    if (queue.length === 0) return;
+    // Drain small batches to avoid blocking
+    const batchSize = 200;
+    for (let i = 0; i < Math.min(batchSize, queue.length); i++) {
+      const m = queue.shift();
+      const conns = masjidConnections.get(masjidId);
+      if (!conns) continue;
+      for (const { ws } of conns.values()) {
+        try {
+          if (Buffer.isBuffer(m)) ws.send(m);
+          else ws.send(m);
+        } catch (err) {
+          safeSend(ws, typeof m === 'string' ? m : m);
+        }
+      }
+    }
+  });
+}
 
 function setupWebSocket(server) {
   const wss = new WebSocket.Server({ server, path: "/ws" });
+  const emitter = new EventEmitter();
+
+  // Log presence of shared secret for easier testing (do NOT log secret value)
+  if (process.env.MASJID_SHARED_SECRET) {
+    console.log('🔐 MASJID_SHARED_SECRET is configured (using shared-key auth fallback)');
+  } else {
+    console.log('⚠️ MASJID_SHARED_SECRET not set — devices must authenticate with Firebase tokens');
+  }
 
   wss.on("connection", async (ws, req) => {
     console.log("✅ New WebSocket connection");
@@ -14,105 +96,186 @@ function setupWebSocket(server) {
     let masjidId = null;
     let deviceId = null;
 
-    // Listen for messages from devices
-    ws.on("message", async (msg) => {
-      try {
-        const data = JSON.parse(msg);
+    // attach status and alive
+    ws.isAlive = true;
+    ws.status = "online";
 
-        // ===== Registration message =====
-        // { type: "register", masjidId: "...", deviceId: "...", token: "..." }
-        if (data.type === "register") {
-          const { masjidId: mId, deviceId: dId, token } = data;
-
-          if (!token || !mId || !dId) {
-            ws.send(JSON.stringify({ type: "error", message: "Missing registration info" }));
-            return;
-          }
-
-          // Verify Firebase token
-          try {
-            const decoded = await admin.auth().verifyIdToken(token);
-            if (!decoded || !decoded.email) {
-              ws.send(JSON.stringify({ type: "error", message: "Invalid token" }));
-              ws.close();
-              return;
-            }
-          } catch (err) {
-            ws.send(JSON.stringify({ type: "error", message: "Token verification failed" }));
-            ws.close();
-            return;
-          }
-
-          masjidId = mId;
-          deviceId = dId;
-
-          if (!masjidConnections[masjidId]) masjidConnections[masjidId] = {};
-          masjidConnections[masjidId][deviceId] = ws;
-          registered = true;
-
-          console.log(`Device registered: ${deviceId} under Masjid: ${masjidId}`);
-
-          // Send acknowledgment
-          ws.send(JSON.stringify({ type: "ack", message: "Registered successfully" }));
+    ws.on("message", async (msg, isBinary) => {
+      // If this is binary, treat as audio chunk from a streamer
+      if (isBinary) {
+        // forward to all devices in masjid (if registered as streamer)
+        if (ws._streamer && ws._masjidId) {
+          const masjidIdStream = ws._masjidId;
+          // enqueue Buffer (Node Buffer) to broadcast queue
+          const buffer = Buffer.from(msg);
+          enqueueBroadcast(masjidIdStream, buffer);
         }
-
-        // ===== Status update message =====
-        // { type: "status", status: "online"/"offline" }
-        if (data.type === "status" && registered) {
-          ws.status = data.status === "online" ? "online" : "offline";
-
-          // Optionally broadcast to other services about status
-          console.log(`Device ${deviceId} status: ${ws.status}`);
-        }
-
-      } catch (err) {
-        console.error("WebSocket message parse error:", err);
+        return;
       }
+
+      // Expect text JSON messages
+      let data;
+      try {
+        data = JSON.parse(msg.toString());
+      } catch (err) {
+        console.error("Invalid JSON from ws client:", err);
+        return;
+      }
+
+      // ===== Registration =====
+      // { type: 'register', masjidId, deviceId, token?, key? }
+      if (data.type === "register") {
+        const { masjidId: mId, deviceId: dId, token, key } = data;
+        if (!mId || !dId) {
+          safeSend(ws, JSON.stringify({ type: "error", message: "Missing registration info" }));
+          return;
+        }
+
+        // Auth: try Firebase token first, else fallback to shared key
+        let authOk = false;
+        try {
+          if (token) {
+            const decoded = await admin.auth().verifyIdToken(token);
+            if (decoded && decoded.uid) authOk = true;
+          } else if (key && process.env.MASJID_SHARED_SECRET && key === process.env.MASJID_SHARED_SECRET) {
+            // Simple shared-secret fallback (use per-masjid secrets in production!)
+            authOk = true;
+          }
+        } catch (err) {
+          console.warn("Token verification failed for device", dId, err && err.message);
+        }
+
+
+        if (!authOk) {
+          safeSend(ws, JSON.stringify({ type: "error", message: "Authentication failed" }));
+          try { ws.close(); } catch (e) {}
+          return;
+        }
+
+  masjidId = mId;
+  deviceId = dId;
+
+  if (!masjidDevices.has(masjidId)) masjidDevices.set(masjidId, new Map());
+  const conns = masjidDevices.get(masjidId);
+  conns.set(deviceId, { ws, status: "online" });
+  registered = true;
+
+  console.log(`Device registered: ${deviceId} under Masjid: ${masjidId}`);
+  safeSend(ws, JSON.stringify({ type: "ack", message: "Registered successfully" }));
+  emitter.emit("registered", { masjidId, deviceId });
+
+  // presence update (throttled)
+  schedulePresenceBroadcast(masjidId);
+        return;
+      }
+
+      // Streamer registration: { type: 'stream-register', masjidId, role: 'streamer', token?, key? }
+      if (data.type === 'stream-register') {
+        const { masjidId: mId, role, token, key } = data;
+        if (!mId || role !== 'streamer') {
+          safeSend(ws, JSON.stringify({ type: "error", message: "Missing stream registration info" }));
+          return;
+        }
+
+        // Authenticate streamer (reuse auth logic)
+        let authOk = false;
+        try {
+          if (token) {
+            const decoded = await admin.auth().verifyIdToken(token);
+            if (decoded && decoded.uid) authOk = true;
+          } else if (key && process.env.MASJID_SHARED_SECRET && key === process.env.MASJID_SHARED_SECRET) {
+            authOk = true;
+          }
+        } catch (err) {
+          console.warn('Stream token verification failed', err && err.message);
+        }
+        if (!authOk) {
+          safeSend(ws, JSON.stringify({ type: "error", message: "Stream auth failed" }));
+          try { ws.close(); } catch (e) {}
+          return;
+        }
+
+        ws._streamer = true;
+        ws._masjidId = mId;
+        if (!masjidStreamers.has(mId)) masjidStreamers.set(mId, new Set());
+        masjidStreamers.get(mId).add(ws);
+        safeSend(ws, JSON.stringify({ type: 'ack', message: 'Streamer registered' }));
+        return;
+      }
+
+      // ===== Status update =====
+      if (data.type === "status" && registered) {
+        const s = data.status === "online" ? "online" : "offline";
+        const conns = masjidConnections.get(masjidId);
+        if (conns && conns.has(deviceId)) conns.get(deviceId).status = s;
+        ws.status = s;
+        console.log(`Device ${deviceId} status: ${s}`);
+        return;
+      }
+
+      // Other message types can be handled here
     });
 
-    // Heartbeat/ping-pong to detect dead connections
-    ws.isAlive = true;
     ws.on("pong", () => { ws.isAlive = true; });
 
-    // Remove device on disconnect
     ws.on("close", () => {
-      if (registered && masjidId && deviceId && masjidConnections[masjidId]) {
-        delete masjidConnections[masjidId][deviceId];
-        console.log(`Device disconnected: ${deviceId} from Masjid: ${masjidId}`);
+      if (registered && masjidId && deviceId && masjidConnections.has(masjidId)) {
+        const conns = masjidConnections.get(masjidId);
+  conns.delete(deviceId);
+  if (conns.size === 0) masjidDevices.delete(masjidId);
+  console.log(`Device disconnected: ${deviceId} from Masjid: ${masjidId}`);
+  emitter.emit("disconnected", { masjidId, deviceId });
+
+  // presence update (throttled)
+  schedulePresenceBroadcast(masjidId);
+      }
+
+      // If this ws was a streamer, remove from streamers set
+      if (ws._streamer && ws._masjidId) {
+        const s = masjidStreamers.get(ws._masjidId);
+        if (s) {
+          s.delete(ws);
+          if (s.size === 0) masjidStreamers.delete(ws._masjidId);
+        }
+        console.log(`Streamer disconnected for masjid: ${ws._masjidId}`);
       }
     });
 
     ws.on("error", (err) => console.error("WebSocket error:", err));
   });
 
-  // Interval to terminate dead connections
+  // Heartbeat: ping clients and terminate dead ones
   const interval = setInterval(() => {
     wss.clients.forEach((ws) => {
       if (!ws.isAlive) return ws.terminate();
       ws.isAlive = false;
-      ws.ping(() => {});
+      try { ws.ping(); } catch (e) {}
     });
   }, 30000);
 
-  console.log("🛰 WebSocket server initialized");
+  console.log("🛰 WebSocket server initialized (robust mode)");
 
   return {
-    // Broadcast a message to all devices of a masjid
     broadcastToMasjid: (masjidId, message) => {
-      if (!masjidConnections[masjidId]) return;
       const msgStr = JSON.stringify(message);
-      Object.values(masjidConnections[masjidId]).forEach((ws) => {
-        if (ws.readyState === WebSocket.OPEN) ws.send(msgStr);
-      });
+      enqueueBroadcast(masjidId, msgStr);
     },
-
-    // Get online device IDs for a masjid
+    // immediate broadcast (sync, try/catch)
+    broadcastImmediate: (masjidId, message) => {
+      const msgStr = JSON.stringify(message);
+      const conns = masjidConnections.get(masjidId);
+      if (!conns) return;
+      for (const { ws } of conns.values()) {
+        safeSend(ws, msgStr);
+      }
+    },
     getMasjidStatus: (masjidId) => {
-      if (!masjidConnections[masjidId]) return [];
-      return Object.entries(masjidConnections[masjidId])
-        .filter(([_, ws]) => ws.readyState === WebSocket.OPEN)
-        .map(([deviceId]) => deviceId);
+      if (!masjidConnections.has(masjidId)) return [];
+      const conns = masjidConnections.get(masjidId);
+      return Array.from(conns.entries()).filter(([_, v]) => v.ws.readyState === WebSocket.OPEN).map(([id]) => id);
     },
+    // expose internal maps for monitoring (read-only recommended)
+    _internal: { masjidConnections, broadcastQueues, emitter, masjidStreamers, presenceTimers },
   };
 }
 

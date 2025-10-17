@@ -17,7 +17,11 @@ export default function ImamDashboard() {
   const [status, setStatus] = useState("");
 
   const wsRef = useRef(null);
-  const API_URL = "http://127.0.0.1:5000"; // replace with your backend URL
+  const streamWsRef = useRef(null);
+  const mediaRecorderRef = useRef(null);
+  const [streaming, setStreaming] = useState(false);
+  const [streamStatus, setStreamStatus] = useState("");
+  const API_URL = "https://redesigned-barnacle-x5gxrwwq76prhpvpj-5000.app.github.dev"; // backend base URL
 
   // Redirect if user info missing or role invalid
   useEffect(() => {
@@ -56,7 +60,15 @@ export default function ImamDashboard() {
         }
       } catch (err) {
         console.error("Error fetching masjid info:", err);
-        setStatus("Failed to fetch Masjid info");
+        const serverMsg = err?.response?.data?.message || null;
+        // If token invalid/expired, force re-login
+        if (err?.response?.status === 401) {
+          alert("Session expired or unauthorized. Please login again.");
+          localStorage.removeItem("user");
+          navigate("/register");
+          return;
+        }
+        setStatus(serverMsg || "Failed to fetch Masjid info");
       }
     };
 
@@ -145,6 +157,186 @@ export default function ImamDashboard() {
       console.error("Error stopping Azan:", err);
       setStatus("Server error");
     }
+  };
+
+  // --- Live voice streaming (capture mic and send binary chunks) ---
+  const getWsProtocol = (baseUrl) => {
+    if (baseUrl.startsWith("https://")) return baseUrl.replace(/^https:/, "wss:");
+    if (baseUrl.startsWith("http://")) return baseUrl.replace(/^http:/, "ws:");
+    return baseUrl;
+  };
+
+  const startStreaming = async () => {
+    if (!masjidId) return alert("Masjid ID missing.");
+    if (!token) return alert("Not authenticated.");
+
+    // Configurable params
+    const TARGET_SAMPLE_RATE = 16000; // desired output sample rate (Hz) — changeable
+    const CHUNK_MS = 100; // ~100ms chunks — changeable
+
+    try {
+      setStreamStatus("Initializing microphone (PCM capture)...");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      // create stream websocket
+      const wsUrl = `${getWsProtocol(API_URL)}/ws`;
+      const sWs = new WebSocket(wsUrl);
+      streamWsRef.current = sWs;
+      sWs.binaryType = "arraybuffer";
+
+      // audio capture using WebAudio (ScriptProcessor fallback)
+      let audioCtx;
+      let sourceNode;
+      let processorNode;
+      let recordedBuffer = [];
+      let recordedSamples = 0;
+
+      // helper: downsample Float32 [-1..1] to target sample rate
+      function downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
+        if (outputSampleRate === inputSampleRate) return buffer;
+        const sampleRateRatio = inputSampleRate / outputSampleRate;
+        const newLength = Math.round(buffer.length / sampleRateRatio);
+        const result = new Float32Array(newLength);
+        let offsetResult = 0;
+        let offsetBuffer = 0;
+        while (offsetResult < result.length) {
+          const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+          // average the samples between offsetBuffer and nextOffsetBuffer
+          let accum = 0, count = 0;
+          for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+            accum += buffer[i];
+            count++;
+          }
+          result[offsetResult] = count > 0 ? accum / count : 0;
+          offsetResult++;
+          offsetBuffer = nextOffsetBuffer;
+        }
+        return result;
+      }
+
+      // helper: convert Float32Array to Int16 LE ArrayBuffer
+      function floatTo16BitPCM(float32Array) {
+        const l = float32Array.length;
+        const buffer = new ArrayBuffer(l * 2);
+        const view = new DataView(buffer);
+        let offset = 0;
+        for (let i = 0; i < l; i++, offset += 2) {
+          let s = Math.max(-1, Math.min(1, float32Array[i]));
+          view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true); // little-endian
+        }
+        return buffer;
+      }
+
+      sWs.onopen = () => {
+        console.log("Stream WS open");
+        const payload = { type: "stream-register", masjidId, role: "streamer", token };
+        sWs.send(JSON.stringify(payload));
+        setStreamStatus("Connected to stream server. Starting PCM capture...");
+
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        sourceNode = audioCtx.createMediaStreamSource(stream);
+
+        // Buffer size: smaller = lower latency, but higher CPU. 2048 is a balance.
+        const BUFFER_SIZE = 2048;
+        processorNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 1, 1);
+
+        const inputSampleRate = audioCtx.sampleRate;
+        const samplesPerChunk = Math.floor((TARGET_SAMPLE_RATE * CHUNK_MS) / 1000);
+
+        processorNode.onaudioprocess = (audioProcessingEvent) => {
+          const inputBuffer = audioProcessingEvent.inputBuffer.getChannelData(0);
+
+          // downsample to target sample rate
+          const down = downsampleBuffer(inputBuffer, inputSampleRate, TARGET_SAMPLE_RATE);
+          recordedBuffer.push(down);
+          recordedSamples += down.length;
+
+          // if we have enough samples for one chunk, send
+          while (recordedSamples >= samplesPerChunk) {
+            // concat pieces into one Float32Array of length samplesPerChunk
+            const out = new Float32Array(samplesPerChunk);
+            let offset = 0;
+            while (offset < samplesPerChunk) {
+              const chunk = recordedBuffer[0];
+              const take = Math.min(chunk.length, samplesPerChunk - offset);
+              out.set(chunk.subarray(0, take), offset);
+              offset += take;
+              if (take < chunk.length) {
+                recordedBuffer[0] = chunk.subarray(take);
+              } else {
+                recordedBuffer.shift();
+              }
+            }
+            recordedSamples -= samplesPerChunk;
+
+            // convert to Int16 LE and send
+            const ab = floatTo16BitPCM(out);
+            if (sWs.readyState === WebSocket.OPEN) {
+              sWs.send(ab);
+            }
+          }
+        };
+
+        sourceNode.connect(processorNode);
+        processorNode.connect(audioCtx.destination); // connect to output to keep processing alive
+
+        mediaRecorderRef.current = { audioCtx, sourceNode, processorNode, stream };
+        setStreaming(true);
+        setStreamStatus('Streaming PCM audio');
+      };
+
+      sWs.onmessage = (ev) => {
+        try {
+          const d = JSON.parse(ev.data);
+          if (d.type === 'presence-update') {
+            // update device lists and counts
+            setAllDeviceIds(d.onlineDevices || []);
+            // optionally mark devices online/offline map
+            const newDevices = {};
+            (d.onlineDevices || []).forEach(id => { newDevices[id] = 'online'; });
+            setDevices(prev => ({ ...prev, ...newDevices }));
+            setStatus(`Online ${d.online || 0} / Total ${d.total || 0}`);
+          } else if (d.type === 'ack') {
+            setStreamStatus(d.message || 'Streamer acked');
+          }
+        } catch (e) { /* ignore non-JSON */ }
+      };
+
+      sWs.onerror = (err) => {
+        console.error('Stream WS error', err);
+        setStreamStatus('Stream WS error');
+      };
+
+      sWs.onclose = () => {
+        setStreaming(false);
+        setStreamStatus('Stream connection closed');
+        try {
+          if (mediaRecorderRef.current) {
+            const { audioCtx, processorNode, sourceNode, stream } = mediaRecorderRef.current;
+            try { processorNode.disconnect(); } catch(e){}
+            try { sourceNode.disconnect(); } catch(e){}
+            try { audioCtx.close(); } catch(e){}
+            try { stream.getTracks().forEach(t => t.stop()); } catch(e){}
+          }
+        } catch(e){}
+      };
+    } catch (err) {
+      console.error('Start streaming failed', err);
+      alert('Failed to start microphone. Allow mic permission and try again.');
+      setStreamStatus('Failed to start streaming');
+    }
+  };
+
+  const stopStreaming = () => {
+    try {
+      const mr = mediaRecorderRef.current;
+      if (mr && mr.state !== 'inactive') mr.stop();
+    } catch (e) { console.warn(e); }
+    try {
+      if (streamWsRef.current && streamWsRef.current.readyState === WebSocket.OPEN) streamWsRef.current.close();
+    } catch (e) { console.warn(e); }
+    setStreaming(false);
+    setStreamStatus('Stopped');
   };
 
   const onlineDevices = allDeviceIds.filter((id) => devices[id] === "online");

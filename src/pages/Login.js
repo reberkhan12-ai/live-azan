@@ -10,6 +10,8 @@ export default function Login() {
   const handleGoogleLogin = async () => {
     setLoading(true);
     try {
+      // Ensure we request email scope and force account selection
+      provider.addScope("email");
       provider.setCustomParameters({ prompt: "select_account" });
       const result = await signInWithPopup(auth, provider);
       const user = result.user;
@@ -18,30 +20,38 @@ export default function Login() {
       const token = await user.getIdToken();
 
       // Call backend to check if user exists and get role
+      const userEmail = user.email || user.providerData?.[0]?.email || null;
+      if (!userEmail) {
+        alert("Unable to get email from Google account. Please try another account or enable email access.");
+        setLoading(false);
+        return;
+      }
+
       const res = await axios.post(
-        "http://localhost:5000/api/auth/check-user",
-        { email: user.email },
+        "https://redesigned-barnacle-x5gxrwwq76prhpvpj-5000.app.github.dev/api/auth/check-user",
+        { email: userEmail },
         { headers: { Authorization: `Bearer ${token}` } }
       );
 
       const data = res.data;
 
       if (data.success) {
+        // Save user info locally for downstream pages
+        localStorage.setItem(
+          "user",
+          JSON.stringify({ userEmail, name: user.displayName, role: data.role || "Momin", token })
+        );
+        console.log("💾 User saved to localStorage (login):", { userEmail, name: user.displayName, role: data.role });
+        
         // ✅ Redirect based on role
         if (data.role === "Imam") {
           if (data.masjidRegistered) {
-            navigate("/imam-dashboard", {
-              state: { userEmail: user.email, name: user.displayName },
-            });
+            navigate("/imam-dashboard", { state: { userEmail, name: user.displayName } });
           } else {
-            navigate("/register-masjid", {
-              state: { userEmail: user.email, name: user.displayName },
-            });
+            navigate("/register-masjid", { state: { userEmail, name: user.displayName } });
           }
         } else if (data.role === "Momin") {
-          navigate("/momin-dashboard", {
-            state: { userEmail: user.email, name: user.displayName },
-          });
+          navigate("/momin-dashboard", { state: { userEmail, name: user.displayName } });
         }
       } else {
         // User not found → redirect to register
