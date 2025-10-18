@@ -16,15 +16,24 @@ const masjidStreamers = new Map();
 // presence broadcast timers per masjid to throttle frequent updates
 const presenceTimers = new Map();
 
-function getPresenceForMasjid(masjidId) {
+async function getPresenceForMasjid(masjidId) {
   const conns = masjidDevices.get(masjidId);
   const onlineDevices = conns ? Array.from(conns.keys()) : [];
-  const total = onlineDevices.length; // currently tracked devices
-  return { masjidId, total, online: total, offline: 0, onlineDevices };
+  // Try to get registered devices from DB for total and registeredDevices
+  let registeredDevices = [];
+  try {
+    const m = await Masjid.findOne({ masjidId }).lean();
+    if (m && Array.isArray(m.devices)) registeredDevices = m.devices;
+  } catch (e) {
+    console.warn('Failed to load masjid devices from DB', e && e.message);
+  }
+  const total = registeredDevices.length || onlineDevices.length;
+  const offline = Math.max(0, total - onlineDevices.length);
+  return { masjidId, total, online: onlineDevices.length, offline, onlineDevices, registeredDevices };
 }
 
-function broadcastPresence(masjidId) {
-  const presence = getPresenceForMasjid(masjidId);
+async function broadcastPresence(masjidId) {
+  const presence = await getPresenceForMasjid(masjidId);
   const payload = JSON.stringify({ type: 'presence-update', ...presence });
   // Send to all streamers for this masjid
   const s = masjidStreamers.get(masjidId);
@@ -38,9 +47,9 @@ function schedulePresenceBroadcast(masjidId) {
   // throttle to max 1 per second
   if (presenceTimers.has(masjidId)) return; // already scheduled
   presenceTimers.set(masjidId, true);
-  setTimeout(() => {
+  setTimeout(async () => {
     presenceTimers.delete(masjidId);
-    try { broadcastPresence(masjidId); } catch (e) { console.error('Presence broadcast error', e); }
+    try { await broadcastPresence(masjidId); } catch (e) { console.error('Presence broadcast error', e); }
   }, 1000);
 }
 
@@ -212,6 +221,12 @@ function setupWebSocket(server) {
         masjidStreamers.get(mId).add(ws);
         console.log(`Streamer registered for masjid ${mId}`);
         safeSend(ws, JSON.stringify({ type: 'ack', message: 'Streamer registered' }));
+        // Immediately send current presence to this streamer so dashboards get an up-to-date view
+        try {
+          await broadcastPresence(mId);
+        } catch (err) {
+          console.warn('Failed to send immediate presence on streamer registration', err && err.message);
+        }
         return;
       }
 
