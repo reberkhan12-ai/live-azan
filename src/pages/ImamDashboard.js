@@ -104,8 +104,21 @@ export default function ImamDashboard() {
     ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
+        // device status messages
         if (msg.deviceId && msg.status) {
           setDevices((prev) => ({ ...prev, [msg.deviceId]: msg.status }));
+        }
+        // presence updates (from server broadcast)
+        if (msg.type === 'presence-update') {
+          setAllDeviceIds(msg.onlineDevices || []);
+          const newDevices = {};
+          (msg.onlineDevices || []).forEach(id => { newDevices[id] = 'online'; });
+          setDevices(prev => ({ ...prev, ...newDevices }));
+          setStatus(`Online ${msg.online || 0} / Total ${msg.total || 0}`);
+        }
+        if (msg.type === 'ack') {
+          // ack messages may be for streamer or other actions
+          setStreamStatus(msg.message || 'Ack received');
         }
       } catch (err) {
         console.error("Invalid WebSocket message:", event.data);
@@ -408,6 +421,27 @@ export default function ImamDashboard() {
             🛑 Stop Azan
           </button>
         </div>
+
+        {/* Live Streaming Controls */}
+        <div className="relative flex justify-center mb-6 space-x-4">
+          {!streaming ? (
+            <button
+              onClick={startStreaming}
+              className="px-6 py-3 rounded-full bg-gradient-to-r from-cyan-500 to-blue-600 text-white font-bold shadow-md"
+            >
+              🎤 Start Streaming
+            </button>
+          ) : (
+            <button
+              onClick={stopStreaming}
+              className="px-6 py-3 rounded-full bg-gradient-to-r from-red-600 to-red-800 text-white font-bold shadow-md"
+            >
+              ⛔ Stop Streaming
+            </button>
+          )}
+        </div>
+
+        <p className="text-sm text-gray-300 mb-4">{streamStatus}</p>
 
         {/* Status Cards */}
         <div className="grid grid-cols-4 gap-4 w-full max-w-md mb-8">
