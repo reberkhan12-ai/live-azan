@@ -21,6 +21,7 @@ export default function ImamDashboard() {
   const mediaRecorderRef = useRef(null);
   const [streaming, setStreaming] = useState(false);
   const [streamStatus, setStreamStatus] = useState("");
+  const [azanActive, setAzanActive] = useState(false);
   const API_URL = "https://redesigned-barnacle-x5gxrwwq76prhpvpj-5000.app.github.dev"; // backend base URL
   // For testing only: shared secret fallback (must match server MASJID_SHARED_SECRET)
   const SHARED_KEY = "test_shared_secret_123";
@@ -114,7 +115,9 @@ export default function ImamDashboard() {
           const newDevices = {};
           (msg.onlineDevices || []).forEach(id => { newDevices[id] = 'online'; });
           setDevices(prev => ({ ...prev, ...newDevices }));
-          setStatus(`Online ${msg.online || 0} / Total ${msg.total || 0}`);
+          // Use presence total as total momin (treat devices as momin count)
+          setTotalMomin(msg.total || (msg.online || 0) || (msg.onlineDevices || []).length);
+          setStatus(`Online ${msg.online || 0} / Total ${msg.total || (msg.online || 0)}`);
         }
         if (msg.type === 'ack') {
           // ack messages may be for streamer or other actions
@@ -406,45 +409,32 @@ export default function ImamDashboard() {
           )}
         </div>
 
-        {/* Live Azan */}
-        <div className="relative flex justify-center mb-8 space-x-4">
+        {/* Single toggle button: Start/Stop Azan (also starts/stops streaming) */}
+        <div className="relative flex justify-center mb-8">
           <button
-            onClick={handleStartAzan}
-            className="w-36 h-36 rounded-full bg-gradient-to-r from-yellow-500 to-orange-600 hover:from-yellow-400 hover:to-orange-500 text-white text-xl font-bold shadow-lg transition-all duration-300"
+            onClick={async () => {
+              // Toggle behavior: start both azan and streaming, or stop both
+              if (!azanActive) {
+                await handleStartAzan();
+                // attempt to start streaming; ignore failures (server will still receive azan)
+                try { await startStreaming(); } catch (e) { console.warn('Streaming start failed', e); }
+                setAzanActive(true);
+              } else {
+                try { await stopStreaming(); } catch (e) { /* ignore */ }
+                await handleStopAzan();
+                setAzanActive(false);
+              }
+            }}
+            className={`w-44 h-44 rounded-full text-white text-xl font-bold shadow-lg transition-all duration-300 ${azanActive ? 'bg-gradient-to-r from-red-600 to-red-800 hover:from-red-500' : 'bg-gradient-to-r from-yellow-500 to-orange-600 hover:from-yellow-400'}`}
           >
-            📢 Start Azan
-          </button>
-          <button
-            onClick={handleStopAzan}
-            className="w-36 h-36 rounded-full bg-gradient-to-r from-gray-600 to-gray-800 hover:from-gray-500 hover:to-gray-700 text-white text-xl font-bold shadow-lg transition-all duration-300"
-          >
-            🛑 Stop Azan
+            {azanActive ? '⛔ Stop Azan' : '📢 Start Azan'}
           </button>
         </div>
 
-        {/* Live Streaming Controls */}
-        <div className="relative flex justify-center mb-6 space-x-4">
-          {!streaming ? (
-            <button
-              onClick={startStreaming}
-              className="px-6 py-3 rounded-full bg-gradient-to-r from-cyan-500 to-blue-600 text-white font-bold shadow-md"
-            >
-              🎤 Start Streaming
-            </button>
-          ) : (
-            <button
-              onClick={stopStreaming}
-              className="px-6 py-3 rounded-full bg-gradient-to-r from-red-600 to-red-800 text-white font-bold shadow-md"
-            >
-              ⛔ Stop Streaming
-            </button>
-          )}
-        </div>
-
-        <p className="text-sm text-gray-300 mb-4">{streamStatus}</p>
+        {/* streaming controlled by Start/Stop Azan button; streamStatus shown below if needed */}
 
         {/* Status Cards */}
-        <div className="grid grid-cols-4 gap-4 w-full max-w-md mb-8">
+        <div className="grid grid-cols-3 gap-4 w-full max-w-md mb-8">
           <div className="bg-green-900/70 border border-green-600 rounded-xl p-4 text-center">
             <h3 className="text-green-300 font-semibold text-sm">🟢 Online</h3>
             <p className="text-green-100 text-lg font-bold mt-1">{onlineDevices.length}</p>
@@ -456,10 +446,6 @@ export default function ImamDashboard() {
           <div className="bg-blue-900/70 border border-blue-600 rounded-xl p-4 text-center">
             <h3 className="text-blue-300 font-semibold text-sm">👤 Total Momin</h3>
             <p className="text-blue-100 text-lg font-bold mt-1">{totalMomin}</p>
-          </div>
-          <div className="bg-purple-900/70 border border-purple-600 rounded-xl p-4 text-center">
-            <h3 className="text-purple-300 font-semibold text-sm">📱 Total Devices</h3>
-            <p className="text-purple-100 text-lg font-bold mt-1">{totalDevices}</p>
           </div>
         </div>
 

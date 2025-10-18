@@ -1,6 +1,7 @@
 const WebSocket = require("ws");
 const admin = require("../firebaseAdmin"); // Firebase admin instance for token verification
 const { EventEmitter } = require("events");
+const Masjid = require("../models/Masjid");
 
 // Structure: { masjidId: Map(deviceId -> { ws, status }) }
 const masjidConnections = new Map();
@@ -168,6 +169,10 @@ function setupWebSocket(server) {
 
   console.log(`Device registered: ${deviceId} under Masjid: ${masjidId} from ${remoteIp}`);
   safeSend(ws, JSON.stringify({ type: "ack", message: "Registered successfully" }));
+  // Persist deviceId into Masjid.devices array if not already present
+  try {
+    Masjid.updateOne({ masjidId }, { $addToSet: { devices: deviceId } }).catch(err => console.error('Failed to persist device in Masjid:', err));
+  } catch (e) { console.error('Error updating masjid devices:', e); }
   emitter.emit("registered", { masjidId, deviceId });
 
   // presence update (throttled)

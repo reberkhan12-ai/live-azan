@@ -9,6 +9,7 @@ const connectDB = require("./config/db");
 const authRoutes = require("./routes/auth");
 const masjidRoutes = require("./routes/masjid");
 const deviceRoutes = require("./routes/device");
+const adminRoutes = require("./routes/admin");
 
 // Import WebSocket setup
 const { setupWebSocket } = require("./ws/websocket");
@@ -26,16 +27,19 @@ connectDB();
 app.use("/api/auth", authRoutes);
 app.use("/api/masjid", masjidRoutes);
 app.use("/api/device", deviceRoutes);
+app.use("/api/admin", adminRoutes);
 
 // ===== Create HTTP server =====
 const server = http.createServer(app);
 
 // ===== Initialize WebSocket server =====
-const { broadcastToMasjid, getMasjidStatus } = setupWebSocket(server);
+const wsHelpers = setupWebSocket(server);
 
 // Make WebSocket helpers accessible in routes/controllers
-app.locals.broadcastToMasjid = broadcastToMasjid;
-app.locals.getMasjidStatus = getMasjidStatus;
+app.locals.broadcastToMasjid = wsHelpers.broadcastToMasjid;
+app.locals.getMasjidStatus = wsHelpers.getMasjidStatus;
+// expose internals for admin/debug (read-only)
+app.locals._ws = wsHelpers._internal || {};
 
 // ===== Start Server =====
 const PORT = process.env.PORT || 5000;
